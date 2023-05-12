@@ -8,6 +8,7 @@ import math
 from collections import deque
 
 import torch
+import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -17,6 +18,11 @@ from torchvision.utils import save_image
 
 from generators import generators
 from discriminators import discriminators
+from srt import data
+from srt.model import SRT
+from srt.trainer import SRTTrainer
+from srt.checkpoint import Checkpoint
+from srt.utils.common import init_ddp
 from siren import siren
 import fid_evaluation
 
@@ -25,6 +31,7 @@ import curriculums
 from tqdm import tqdm
 from datetime import datetime
 import copy
+import yaml
 
 from torch_ema import ExponentialMovingAverage
 
@@ -61,9 +68,47 @@ def z_sampler(shape, device, dist):
 def train(rank, world_size, opt):
     torch.manual_seed(0)
 
+    # cfg (config.yaml)
+    with open(opt.config, 'r') as f:
+        cfg = yaml.load(f, Loader=yaml.CLoader)
+
     setup(rank, world_size, opt.port)
     device = torch.device(rank)
 
+    #wandb?
+    opt.wandb = opt.wandb and rank == 0  # Only log to wandb in main process
+
+    #max iteration -> pi gan에선 필요 없을듯
+    if opt.exit_after is not None:
+        max_it = opt.exit_after
+    elif 'max_it' in cfg['training']:
+        max_it = cfg['training']['max_it']
+    else:
+        max_it = 1000000
+
+    # -> pi gan에선 필요 없을듯 22
+    exp_name = os.path.basename(os.path.dirname(opt.config))
+    if opt.rtpt is not None:
+        from rtpt import RTPT
+        rtpt = RTPT(name_initials=opt.rtpt, experiment_name=exp_name, max_iterations=max_it)
+
+    # out_dir = os.path.dirname(args.config)
+    # output_dir 이랑 겹침
+
+    # config.yaml 쓸 거면 metadata['batch_size'] 말고 이거 써야할 듯
+    batch_size = cfg['training']['batch_size'] // world_size
+
+    model_selection_metric = cfg['training']['model_selection_metric']
+    if cfg['training']['model_selection_mode'] == 'maximize':
+        model_selection_sign = 1
+    elif cfg['training']['model_selection_mode'] == 'minimize':
+        model_selection_sign = -1
+    else:
+        raise ValueError('model_selection_mode must be either maximize or minimize.')
+    
+    
+
+    #data loader는 Training part 안에서 해야할 듯
 
     curriculum = getattr(curriculums, opt.curriculum)
     metadata = curriculums.extract_metadata(curriculum, 0)
@@ -82,17 +127,27 @@ def train(rank, world_size, opt):
         ema = torch.load(os.path.join(opt.load_dir, 'ema.pth'), map_location=device)
         ema2 = torch.load(os.path.join(opt.load_dir, 'ema2.pth'), map_location=device)
     else:
-        generator = getattr(generators, metadata['generator'])(SIREN, metadata['latent_dim']).to(device)
+        #generator = getattr(generators, metadata['generator'])(SIREN, metadata['latent_dim']).to(device)
+        generator = SRT(cfg['model']).to(device)
         discriminator = getattr(discriminators, metadata['discriminator'])().to(device)
         ema = ExponentialMovingAverage(generator.parameters(), decay=0.999)
         ema2 = ExponentialMovingAverage(generator.parameters(), decay=0.9999)
+
+    if world_size > 1:
+        generator.encoder = DDP(generator.encoder, device_ids=[rank], output_device=rank)
+        generator.decoder = DDP(generator.decoder, device_ids=[rank], output_device=rank)
+        encoder_module = generator.encoder.module
+        decoder_module = generator.decoder.module
+    else:
+        encoder_module = generator.encoder
+        decoder_module = generator.decoder
 
     generator_ddp = DDP(generator, device_ids=[rank], find_unused_parameters=True)
     discriminator_ddp = DDP(discriminator, device_ids=[rank], find_unused_parameters=True, broadcast_buffers=False)
     generator = generator_ddp.module
     discriminator = discriminator_ddp.module
 
-
+    # lr은 보류
 
     if metadata.get('unique_lr', False):
         mapping_network_param_names = [name for name, _ in generator_ddp.module.siren.mapping_network.named_parameters()]
@@ -122,7 +177,7 @@ def train(rank, world_size, opt):
     if metadata.get('disable_scaler', False):
         scaler = torch.cuda.amp.GradScaler(enabled=False)
 
-    generator.set_device(device)
+    #generator.set_device(device)
 
     # ----------
     #  Training
@@ -137,8 +192,61 @@ def train(rank, world_size, opt):
         f.write('\n\n')
         f.write(str(curriculum))
 
+    # Initialize datasets
+    print('Loading training set...')
+    train_dataset = data.get_dataset('train', cfg['data'])
+    eval_split = 'test' if opt.test else 'val'
+    print(f'Loading {eval_split} set...')
+    eval_dataset = data.get_dataset(eval_split, cfg['data'],
+                                    max_len=opt.max_eval, full_scale=opt.full_scale)
+
+    num_workers = cfg['training']['num_workers'] if 'num_workers' in cfg['training'] else 1
+    print(f'Using {num_workers} workers per process for data loading.')
+
+    # Initialize data loaders
+    train_sampler = val_sampler = None
+    shuffle = False
+    if isinstance(train_dataset, torch.utils.data.IterableDataset):
+        assert num_workers == 1, "Our MSN dataset is implemented as Tensorflow iterable, and does not currently support multiple PyTorch workers per process. Is also shouldn't need any, since Tensorflow uses multiple workers internally."
+    else:
+        if world_size >= 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(
+                train_dataset, shuffle=True, drop_last=False)
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                eval_dataset, shuffle=True, drop_last=False)
+        else:
+            shuffle = True
+
     torch.manual_seed(rank)
     dataloader = None
+
+    # loader for SRT
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+        sampler=train_sampler, shuffle=shuffle,
+        worker_init_fn=data.worker_init_fn, persistent_workers=True)
+
+    val_loader = torch.utils.data.DataLoader(
+        eval_dataset, batch_size=max(1, batch_size // 8), num_workers=1, 
+        sampler=val_sampler, shuffle=shuffle,
+        pin_memory=False, worker_init_fn=data.worker_init_fn, persistent_workers=True)
+    
+    dataloader = train_loader
+
+    # Loaders for visualization scenes
+    vis_loader_val = torch.utils.data.DataLoader(
+        eval_dataset, batch_size=12, shuffle=shuffle, worker_init_fn=data.worker_init_fn)
+    vis_loader_train = torch.utils.data.DataLoader(
+        train_dataset, batch_size=12, shuffle=shuffle, worker_init_fn=data.worker_init_fn)
+    print('Data loaders initialized.')
+
+    #data_vis_val = next(iter(vis_loader_val))  # Validation set data for visualization
+    #train_dataset.mode = 'val'  # Get validation info from training set just this once
+    #data_vis_train = next(iter(vis_loader_train))  # Validation set data for visualization
+    #train_dataset.mode = 'train'
+    #print('Visualization data loaded.')
+    # ~
+
     total_progress_bar = tqdm(total = opt.n_epochs, desc = "Total progress", dynamic_ncols=True)
     total_progress_bar.update(discriminator.epoch)
     interior_step_bar = tqdm(dynamic_ncols=True)
@@ -160,12 +268,23 @@ def train(rank, world_size, opt):
             param_group['betas'] = metadata['betas']
             param_group['weight_decay'] = metadata['weight_decay']
 
+        '''
         if not dataloader or dataloader.batch_size != metadata['batch_size']:
             dataloader, CHANNELS = datasets.get_dataset_distributed(metadata['dataset'],
                                         world_size,
                                         rank,
                                         **metadata)
 
+            step_next_upsample = curriculums.next_upsample_step(curriculum, discriminator.step)
+            step_last_upsample = curriculums.last_upsample_step(curriculum, discriminator.step)
+
+
+            interior_step_bar.reset(total=(step_next_upsample - step_last_upsample))
+            interior_step_bar.set_description(f"Progress to next stage")
+            interior_step_bar.update((discriminator.step - step_last_upsample))
+        '''
+
+        if not dataloader or dataloader.batch_size != batch_size:
             step_next_upsample = curriculums.next_upsample_step(curriculum, discriminator.step)
             step_last_upsample = curriculums.last_upsample_step(curriculum, discriminator.step)
 
@@ -187,7 +306,8 @@ def train(rank, world_size, opt):
                 torch.save(scaler.state_dict(), os.path.join(opt.output_dir, now + 'scaler.pth'))
             metadata = curriculums.extract_metadata(curriculum, discriminator.step)
 
-            if dataloader.batch_size != metadata['batch_size']: break
+            #if dataloader.batch_size != metadata['batch_size']: break
+            if dataloader.batch_size != batch_size: break
 
             if scaler.get_scale() < 1:
                 scaler.update(1.)
@@ -238,7 +358,7 @@ def train(rank, world_size, opt):
                 if metadata['z_lambda'] > 0 or metadata['pos_lambda'] > 0:
                     latent_penalty = torch.nn.MSELoss()(g_pred_latent, z) * metadata['z_lambda']
                     position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
-                    identity_penalty = latent_penalty + position_penalty
+                    identity_penalty = latent_penalty #+ position_penalty
                 else:
                     identity_penalty=0
 
@@ -260,7 +380,10 @@ def train(rank, world_size, opt):
             for split in range(metadata['batch_split']):
                 with torch.cuda.amp.autocast():
                     subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
-                    gen_imgs, gen_positions = generator_ddp(subset_z, **metadata)
+                    #gen_imgs, gen_positions = generator_ddp(subset_z, **metadata)
+                    gen_imgs = generator_ddp(**metadata)
+                    trainer = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
+                    gen_imgs = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
                     g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
 
                     topk_percentage = max(0.99 ** (discriminator.step/metadata['topk_interval']), metadata['topk_v']) if 'topk_interval' in metadata and 'topk_v' in metadata else 1
@@ -271,7 +394,7 @@ def train(rank, world_size, opt):
                     if metadata['z_lambda'] > 0 or metadata['pos_lambda'] > 0:
                         latent_penalty = torch.nn.MSELoss()(g_pred_latent, subset_z) * metadata['z_lambda']
                         position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
-                        identity_penalty = latent_penalty + position_penalty
+                        identity_penalty = latent_penalty #+ position_penalty
                     else:
                         identity_penalty = 0
 
@@ -392,6 +515,17 @@ if __name__ == '__main__':
     parser.add_argument('--port', type=str, default='12355')
     parser.add_argument('--set_step', type=int, default=None)
     parser.add_argument('--model_save_interval', type=int, default=5000)
+
+    parser.add_argument('config', type=str, help='Path to config file.')
+    parser.add_argument('--exit-after', type=int, help='Exit after this many training iterations.')
+    parser.add_argument('--test', action='store_true', help='When evaluating, use test instead of validation split.')
+    parser.add_argument('--evalnow', action='store_true', help='Run evaluation on startup.')
+    parser.add_argument('--visnow', action='store_true', help='Run visualization on startup.')
+    parser.add_argument('--wandb', action='store_true', help='Log run to Weights and Biases.')
+    parser.add_argument('--max-eval', type=int, help='Limit the number of scenes in the evaluation set.')
+    parser.add_argument('--full-scale', action='store_true', help='Evaluate on full images.')
+    parser.add_argument('--print-model', action='store_true', help='Print model and parameters on startup.')
+    parser.add_argument('--rtpt', type=str, help='Use rtpt to set process name with given initials.')
 
     opt = parser.parse_args()
     print(opt)
