@@ -128,7 +128,7 @@ def train(rank, world_size, opt):
         ema2 = torch.load(os.path.join(opt.load_dir, 'ema2.pth'), map_location=device)
     else:
         #generator = getattr(generators, metadata['generator'])(SIREN, metadata['latent_dim']).to(device)
-        generator = SRT(cfg['model']).to(device)
+        generator = SRT(cfg['model']).train().to(device)
         discriminator = getattr(discriminators, metadata['discriminator'])().to(device)
         ema = ExponentialMovingAverage(generator.parameters(), decay=0.999)
         ema2 = ExponentialMovingAverage(generator.parameters(), decay=0.9999)
@@ -243,13 +243,24 @@ def train(rank, world_size, opt):
     #data_vis_val = next(iter(vis_loader_val))  # Validation set data for visualization
     #train_dataset.mode = 'val'  # Get validation info from training set just this once
     #data_vis_train = next(iter(vis_loader_train))  # Validation set data for visualization
-    #train_dataset.mode = 'train'
-    #print('Visualization data loaded.')
+    data_vis_train = iter(vis_loader_train)
+    train_dataset.mode = 'train'
+    print('Visualization data loaded.')
     # ~
 
     total_progress_bar = tqdm(total = opt.n_epochs, desc = "Total progress", dynamic_ncols=True)
     total_progress_bar.update(discriminator.epoch)
     interior_step_bar = tqdm(dynamic_ncols=True)
+    #
+    epoch_it = 1
+    train_sampler.set_epoch(epoch_it)
+
+    print_every = cfg['training']['print_every']
+    checkpoint_every = cfg['training']['checkpoint_every']
+    validate_every = cfg['training']['validate_every']
+    visualize_every = cfg['training']['visualize_every']
+    backup_every = cfg['training']['backup_every']
+
     for _ in range (opt.n_epochs):
         total_progress_bar.update(1)
 
@@ -278,7 +289,7 @@ def train(rank, world_size, opt):
             step_next_upsample = curriculums.next_upsample_step(curriculum, discriminator.step)
             step_last_upsample = curriculums.last_upsample_step(curriculum, discriminator.step)
 
-
+        
             interior_step_bar.reset(total=(step_next_upsample - step_last_upsample))
             interior_step_bar.set_description(f"Progress to next stage")
             interior_step_bar.update((discriminator.step - step_last_upsample))
@@ -376,14 +387,14 @@ def train(rank, world_size, opt):
             z = z_sampler((imgs.shape[0], metadata['latent_dim']), device=device, dist=metadata['z_dist'])
 
             split_batch_size = z.shape[0] // metadata['batch_split']
+            trainer = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
 
             for split in range(metadata['batch_split']):
                 with torch.cuda.amp.autocast():
                     subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
                     #gen_imgs, gen_positions = generator_ddp(subset_z, **metadata)
                     gen_imgs = generator_ddp(**metadata)
-                    trainer = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
-                    gen_imgs = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
+                    
                     g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
 
                     topk_percentage = max(0.99 ** (discriminator.step/metadata['topk_interval']), metadata['topk_v']) if 'topk_interval' in metadata and 'topk_v' in metadata else 1
@@ -478,6 +489,12 @@ def train(rank, world_size, opt):
                     torch.save(generator_losses, os.path.join(opt.output_dir, 'generator.losses'))
                     torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))
 
+                # Visualize Output
+                if opt.visnow or (i > 0 and visualize_every > 0 and (i % visualize_every) == 0):
+                    print('Visualizing...')
+                    #trainer.visualize(data_vis_val, mode='val')
+                    trainer.visualize(data_vis_train, mode='train')
+
             if opt.eval_freq > 0 and (discriminator.step + 1) % opt.eval_freq == 0:
                 generated_dir = os.path.join(opt.output_dir, 'evaluation/generated')
 
@@ -500,7 +517,8 @@ def train(rank, world_size, opt):
             discriminator.step += 1
             generator.step += 1
         discriminator.epoch += 1
-        generator.epoch += 1
+        #generator.epoch += 1
+        epoch_it += 1
 
     cleanup()
 
