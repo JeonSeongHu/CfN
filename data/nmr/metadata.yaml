@@ -3,10 +3,10 @@
     #    "id": "04256520",
     #    "name": "sofa,couch,lounge"
     #},
-    #"02691156": {
-    #    "id": "02691156",
-    #    "name": "airplane,aeroplane,plane"
-    #},
+    "02691156": {
+        "id": "02691156",
+        "name": "airplane,aeroplane,plane"
+    },
     #"03636649": {
     #    "id": "03636649",
     #    "name": "lamp"
@@ -43,12 +43,12 @@
     #    "id": "02958343",
     #    "name": "car,auto,automobile,machine,motorcar"
     #},
-    #"02828884": {
-    #    "id": "02828884",
-    #    "name": "bench"
+    "02828884": {
+        "id": "02828884",
+        "name": "bench"
     #},
     #"04090263": {
     #    "id": "04090263",
     #    "name": "rifle"
-    #}*
+    }
 }

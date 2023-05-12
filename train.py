@@ -92,8 +92,7 @@ def train(rank, world_size, opt):
         from rtpt import RTPT
         rtpt = RTPT(name_initials=opt.rtpt, experiment_name=exp_name, max_iterations=max_it)
 
-    # out_dir = os.path.dirname(args.config)
-    # output_dir 이랑 겹침
+    # out_dir = os.path.dirname(args.config) -> opt.output_dir
 
     # config.yaml 쓸 거면 metadata['batch_size'] 말고 이거 써야할 듯
     batch_size = cfg['training']['batch_size'] // world_size
@@ -105,10 +104,7 @@ def train(rank, world_size, opt):
         model_selection_sign = -1
     else:
         raise ValueError('model_selection_mode must be either maximize or minimize.')
-    
-    
 
-    #data loader는 Training part 안에서 해야할 듯
 
     curriculum = getattr(curriculums, opt.curriculum)
     metadata = curriculums.extract_metadata(curriculum, 0)
@@ -146,8 +142,6 @@ def train(rank, world_size, opt):
     discriminator_ddp = DDP(discriminator, device_ids=[rank], find_unused_parameters=True, broadcast_buffers=False)
     generator = generator_ddp.module
     discriminator = discriminator_ddp.module
-
-    # lr은 보류
 
     if metadata.get('unique_lr', False):
         mapping_network_param_names = [name for name, _ in generator_ddp.module.siren.mapping_network.named_parameters()]
@@ -240,10 +234,9 @@ def train(rank, world_size, opt):
         train_dataset, batch_size=12, shuffle=shuffle, worker_init_fn=data.worker_init_fn)
     print('Data loaders initialized.')
 
-    #data_vis_val = next(iter(vis_loader_val))  # Validation set data for visualization
-    #train_dataset.mode = 'val'  # Get validation info from training set just this once
-    #data_vis_train = next(iter(vis_loader_train))  # Validation set data for visualization
-    data_vis_train = iter(vis_loader_train)
+    data_vis_val = next(iter(vis_loader_val))  # Validation set data for visualization
+    train_dataset.mode = 'val'  # Get validation info from training set just this once
+    data_vis_train = next(iter(vis_loader_train))  # Validation set data for visualization
     train_dataset.mode = 'train'
     print('Visualization data loaded.')
     # ~
@@ -304,17 +297,18 @@ def train(rank, world_size, opt):
             interior_step_bar.set_description(f"Progress to next stage")
             interior_step_bar.update((discriminator.step - step_last_upsample))
 
-        for i, (imgs, _) in enumerate(dataloader):
+        # input_images, input_camera_pos, input_rays, target_pixels, target_rays, scendid, transform
+        for i, (imgs, _, _, _, _, _, _, _) in enumerate(dataloader):
             if discriminator.step % opt.model_save_interval == 0 and rank == 0:
                 now = datetime.now()
                 now = now.strftime("%d--%H:%M--")
-                torch.save(ema, os.path.join(opt.output_dir, now + 'ema.pth'))
-                torch.save(ema2, os.path.join(opt.output_dir, now + 'ema2.pth'))
-                torch.save(generator_ddp.module, os.path.join(opt.output_dir, now + 'generator.pth'))
-                torch.save(discriminator_ddp.module, os.path.join(opt.output_dir, now + 'discriminator.pth'))
-                torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, now + 'optimizer_G.pth'))
-                torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, now + 'optimizer_D.pth'))
-                torch.save(scaler.state_dict(), os.path.join(opt.output_dir, now + 'scaler.pth'))
+                #torch.save(ema, os.path.join(opt.output_dir, now + 'ema.pth'))
+                #torch.save(ema2, os.path.join(opt.output_dir, now + 'ema2.pth'))
+                #torch.save(generator_ddp.module, os.path.join(opt.output_dir, now + 'generator.pth'))
+                #torch.save(discriminator_ddp.module, os.path.join(opt.output_dir, now + 'discriminator.pth'))
+                #torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, now + 'optimizer_G.pth'))
+                #torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, now + 'optimizer_D.pth'))
+                #torch.save(scaler.state_dict(), os.path.join(opt.output_dir, now + 'scaler.pth'))
             metadata = curriculums.extract_metadata(curriculum, discriminator.step)
 
             #if dataloader.batch_size != metadata['batch_size']: break
@@ -342,7 +336,8 @@ def train(rank, world_size, opt):
                     gen_positions = []
                     for split in range(metadata['batch_split']):
                         subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
-                        g_imgs, g_pos = generator_ddp(subset_z, **metadata)
+                        #g_imgs, g_pos = generator_ddp(subset_z, **metadata)            
+                        g_imgs, g_pos = trainer.visualize(data_vis_train, mode='train')
 
                         gen_imgs.append(g_imgs)
                         gen_positions.append(g_pos)
@@ -368,7 +363,7 @@ def train(rank, world_size, opt):
                 g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
                 if metadata['z_lambda'] > 0 or metadata['pos_lambda'] > 0:
                     latent_penalty = torch.nn.MSELoss()(g_pred_latent, z) * metadata['z_lambda']
-                    position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
+                    #position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
                     identity_penalty = latent_penalty #+ position_penalty
                 else:
                     identity_penalty=0
@@ -393,7 +388,7 @@ def train(rank, world_size, opt):
                 with torch.cuda.amp.autocast():
                     subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
                     #gen_imgs, gen_positions = generator_ddp(subset_z, **metadata)
-                    gen_imgs = generator_ddp(**metadata)
+                    gen_imgs, gen_positions = trainer.visualize(data_vis_train, mode='train')
                     
                     g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
 
@@ -404,7 +399,7 @@ def train(rank, world_size, opt):
 
                     if metadata['z_lambda'] > 0 or metadata['pos_lambda'] > 0:
                         latent_penalty = torch.nn.MSELoss()(g_pred_latent, subset_z) * metadata['z_lambda']
-                        position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
+                        #position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
                         identity_penalty = latent_penalty #+ position_penalty
                     else:
                         identity_penalty = 0
@@ -490,10 +485,10 @@ def train(rank, world_size, opt):
                     torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))
 
                 # Visualize Output
-                if opt.visnow or (i > 0 and visualize_every > 0 and (i % visualize_every) == 0):
-                    print('Visualizing...')
+                #if opt.visnow or (i > 0 and visualize_every > 0 and (i % visualize_every) == 0):
+                #    print('Visualizing...')
                     #trainer.visualize(data_vis_val, mode='val')
-                    trainer.visualize(data_vis_train, mode='train')
+                #    trainer.visualize(data_vis_train, mode='train')
 
             if opt.eval_freq > 0 and (discriminator.step + 1) % opt.eval_freq == 0:
                 generated_dir = os.path.join(opt.output_dir, 'evaluation/generated')
@@ -528,7 +523,7 @@ if __name__ == '__main__':
     parser.add_argument("--sample_interval", type=int, default=200, help="interval between image sampling")
     parser.add_argument('--output_dir', type=str, default='debug')
     parser.add_argument('--load_dir', type=str, default='')
-    parser.add_argument('--curriculum', type=str, required=True)
+    parser.add_argument('--curriculum', type=str)
     parser.add_argument('--eval_freq', type=int, default=5000)
     parser.add_argument('--port', type=str, default='12355')
     parser.add_argument('--set_step', type=int, default=None)
