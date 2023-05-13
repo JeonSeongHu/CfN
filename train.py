@@ -300,7 +300,7 @@ def train(rank, world_size, opt):
 
         # input_images, input_camera_pos, input_rays, 
         # target_pixels, target_camera_pos, target_rays, scendid, transform
-        for i, (imgs, _, _, _, _, _, _, _) in enumerate(dataloader):
+        for i, batch in enumerate(dataloader):
             if discriminator.step % opt.model_save_interval == 0 and rank == 0:
                 now = datetime.now()
                 now = now.strftime("%d--%H:%M--")
@@ -324,9 +324,13 @@ def train(rank, world_size, opt):
 
             alpha = min(1, (discriminator.step - step_last_upsample) / (metadata['fade_steps']))
 
+            #real_imgs = imgs.to(device, non_blocking=True)
+            imgs = batch.get("input_images")
             real_imgs = imgs.to(device, non_blocking=True)
 
             metadata['nerf_noise'] = max(0, 1. - discriminator.step/5000.)
+            trainer = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
+
 
             # TRAIN DISCRIMINATOR
             with torch.cuda.amp.autocast():
@@ -339,14 +343,22 @@ def train(rank, world_size, opt):
                     for split in range(metadata['batch_split']):
                         subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
                         #g_imgs, g_pos = generator_ddp(subset_z, **metadata)            
-                        g_imgs, g_pos = trainer.visualize(data_vis_train, mode='train')
+                        #g_imgs, g_pos = trainer.visualize(data_vis_train, mode='train')
+                        g_imgs, _ = trainer.compute_loss(data_vis_train)
 
                         gen_imgs.append(g_imgs)
-                        gen_positions.append(g_pos)
+                        #gen_positions.append(g_pos)
 
+                    #gen_imgs = sum(gen_imgs, [])
                     gen_imgs = torch.cat(gen_imgs, axis=0)
-                    gen_positions = torch.cat(gen_positions, axis=0)
+                    #gen_positions = sum(gen_positions, [])
+                    #gen_positions = torch.cat(gen_positions, axis=0)
 
+                #print(gen_imgs.shape)
+
+                gen_imgs = gen_imgs.permute(0, 2, 1)
+                gen_imgs = gen_imgs.reshape(-1, 3, 64, 64)
+                real_imgs = real_imgs.permute(0, 2, 3, 4, 1).squeeze(dim = -1)
                 real_imgs.requires_grad = True
                 r_preds, _, _ = discriminator_ddp(real_imgs, alpha, **metadata)
 
@@ -384,8 +396,7 @@ def train(rank, world_size, opt):
             z = z_sampler((imgs.shape[0], metadata['latent_dim']), device=device, dist=metadata['z_dist'])
 
             split_batch_size = z.shape[0] // metadata['batch_split']
-            trainer = SRTTrainer(generator, optimizer_G, cfg, device, opt.output_dir, train_dataset.render_kwargs)
-
+            
             for split in range(metadata['batch_split']):
                 with torch.cuda.amp.autocast():
                     subset_z = z[split * split_batch_size:(split+1) * split_batch_size]

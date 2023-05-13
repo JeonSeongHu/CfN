@@ -85,6 +85,7 @@ def draw_visualization_grid(columns, outfile, row_labels=None, name=None):
         for r in range(num_rows):
             axes[r, 0].set_ylabel(row_labels[r])
 
+    #plt.show()
     plt.savefig(f'{outfile}.png')
     plt.close()
 

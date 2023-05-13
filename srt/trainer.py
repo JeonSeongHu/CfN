@@ -65,7 +65,7 @@ class SRTTrainer:
         self.optimizer.step()
         return loss.item(), loss_terms
 
-    def compute_loss(self, data, it):
+    def compute_loss(self, data):
         device = self.device
 
         input_images = data.get('input_images').to(device)
@@ -81,16 +81,20 @@ class SRTTrainer:
         loss = 0.
         loss_terms = dict()
 
+        print(input_images.shape)
+        print(target_pixels.shape)
+
         pred_pixels, extras = self.model.decoder(z, target_camera_pos, target_rays, **self.render_kwargs)
 
-        loss = loss + ((pred_pixels - target_pixels)**2).mean((1, 2))
+        '''loss = loss + ((pred_pixels - target_pixels)**2).mean((1, 2))
         loss_terms['mse'] = loss
         if 'coarse_img' in extras:
             coarse_loss = ((extras['coarse_img'] - target_pixels)**2).mean((1, 2))
             loss_terms['coarse_mse'] = coarse_loss
             loss = loss + coarse_loss
 
-        return loss, loss_terms
+        return loss, loss_terms'''
+        return pred_pixels, extras
 
     def eval_step(self, data, full_scale=False):
         with torch.no_grad():
@@ -198,6 +202,7 @@ class SRTTrainer:
                     columns.append((f'depths {angle_deg}°', depth_img.cpu().numpy(), 'image'))
 
             output_img_path = os.path.join(self.out_dir, f'renders-{mode}')
-            vis.draw_visualization_grid(columns, output_img_path)
+            #print(output_img_path)
+            #vis.draw_visualization_grid(columns, output_img_path)
             return imgs, poses
 
