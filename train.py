@@ -287,7 +287,8 @@ def train(rank, world_size, opt):
             interior_step_bar.set_description(f"Progress to next stage")
             interior_step_bar.update((discriminator.step - step_last_upsample))
         '''
-
+        step_next_upsample = 0
+        step_last_upsample = 0
         if not dataloader or dataloader.batch_size != batch_size:
             step_next_upsample = curriculums.next_upsample_step(curriculum, discriminator.step)
             step_last_upsample = curriculums.last_upsample_step(curriculum, discriminator.step)
@@ -297,7 +298,8 @@ def train(rank, world_size, opt):
             interior_step_bar.set_description(f"Progress to next stage")
             interior_step_bar.update((discriminator.step - step_last_upsample))
 
-        # input_images, input_camera_pos, input_rays, target_pixels, target_rays, scendid, transform
+        # input_images, input_camera_pos, input_rays, 
+        # target_pixels, target_camera_pos, target_rays, scendid, transform
         for i, (imgs, _, _, _, _, _, _, _) in enumerate(dataloader):
             if discriminator.step % opt.model_save_interval == 0 and rank == 0:
                 now = datetime.now()
