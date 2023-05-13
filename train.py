@@ -4,9 +4,9 @@ import argparse
 import os
 import numpy as np
 import math
-
+import matplotlib.pyplot as plt
 from collections import deque
-
+import gc
 import torch
 import torch.optim as optim
 import torch.distributed as dist
@@ -66,6 +66,7 @@ def z_sampler(shape, device, dist):
 
 
 def train(rank, world_size, opt):
+    torch.cuda.empty_cache()
     torch.manual_seed(0)
 
     # cfg (config.yaml)
@@ -138,23 +139,35 @@ def train(rank, world_size, opt):
         encoder_module = generator.encoder
         decoder_module = generator.decoder
 
-    generator_ddp = DDP(generator, device_ids=[rank], find_unused_parameters=True)
+    # generator_ddp = DDP(generator, device_ids=[rank], find_unused_parameters=True)
     discriminator_ddp = DDP(discriminator, device_ids=[rank], find_unused_parameters=True, broadcast_buffers=False)
-    generator = generator_ddp.module
+    # generator = generator_ddp.module
     discriminator = discriminator_ddp.module
 
-    if metadata.get('unique_lr', False):
-        mapping_network_param_names = [name for name, _ in generator_ddp.module.siren.mapping_network.named_parameters()]
-        mapping_network_parameters = [p for n, p in generator_ddp.named_parameters() if n in mapping_network_param_names]
-        generator_parameters = [p for n, p in generator_ddp.named_parameters() if n not in mapping_network_param_names]
-        optimizer_G = torch.optim.Adam([{'params': generator_parameters, 'name': 'generator'},
-                                        {'params': mapping_network_parameters, 'name': 'mapping_network', 'lr':metadata['gen_lr']*5e-2}],
-                                       lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
-    else:
-        optimizer_G = torch.optim.Adam(generator_ddp.parameters(), lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
+    # if metadata.get('unique_lr', False):
+    #     mapping_network_param_names = [name for name, _ in generator_ddp.module.siren.mapping_network.named_parameters()]
+    #     mapping_network_parameters = [p for n, p in generator_ddp.named_parameters() if n in mapping_network_param_names]
+    #     generator_parameters = [p for n, p in generator_ddp.named_parameters() if n not in mapping_network_param_names]
+    #     optimizer_G = torch.optim.Adam([{'params': generator_parameters, 'name': 'generator'},
+    #                                     {'params': mapping_network_parameters, 'name': 'mapping_network', 'lr':metadata['gen_lr']*5e-2}],
+    #                                    lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
+    # else:
+    #     optimizer_G = torch.optim.Adam(generator_ddp.parameters(), lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
+    #
+    # optimizer_D = torch.optim.Adam(discriminator_ddp.parameters(), lr=metadata['disc_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
 
+    # if metadata.get('unique_lr', False):
+    #     mapping_network_param_names = [name for name, _ in generator.module.siren.mapping_network.named_parameters()]
+    #     mapping_network_parameters = [p for n, p in generator.named_parameters() if n in mapping_network_param_names]
+    #     generator_parameters = [p for n, p in generator.named_parameters() if n not in mapping_network_param_names]
+    #     optimizer_G = torch.optim.Adam([{'params': generator_parameters, 'name': 'generator'},
+    #                                     {'params': mapping_network_parameters, 'name': 'mapping_network', 'lr':metadata['gen_lr']*5e-2}],
+    #                                    lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
+    # else:
+    #     optimizer_G = torch.optim.Adam(generator.parameters(), lr=metadata['gen_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=metadata['gen_lr'], betas=metadata['betas'],
+                                   weight_decay=metadata['weight_decay'])
     optimizer_D = torch.optim.Adam(discriminator_ddp.parameters(), lr=metadata['disc_lr'], betas=metadata['betas'], weight_decay=metadata['weight_decay'])
-
     if opt.load_dir != '':
         optimizer_G.load_state_dict(torch.load(os.path.join(opt.load_dir, 'optimizer_G.pth')))
         optimizer_D.load_state_dict(torch.load(os.path.join(opt.load_dir, 'optimizer_D.pth')))
@@ -201,7 +214,8 @@ def train(rank, world_size, opt):
     train_sampler = val_sampler = None
     shuffle = False
     if isinstance(train_dataset, torch.utils.data.IterableDataset):
-        assert num_workers == 1, "Our MSN dataset is implemented as Tensorflow iterable, and does not currently support multiple PyTorch workers per process. Is also shouldn't need any, since Tensorflow uses multiple workers internally."
+        pass
+        # assert num_workers == 1, "Our MSN dataset is implemented as Tensorflow iterable, and does not currently support multiple PyTorch workers per process. Is also shouldn't need any, since Tensorflow uses multiple workers internally."
     else:
         if world_size >= 1:
             train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -218,12 +232,12 @@ def train(rank, world_size, opt):
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
         sampler=train_sampler, shuffle=shuffle,
-        worker_init_fn=data.worker_init_fn, persistent_workers=True)
+        worker_init_fn=data.worker_init_fn, persistent_workers=False)
 
     val_loader = torch.utils.data.DataLoader(
         eval_dataset, batch_size=max(1, batch_size // 8), num_workers=1, 
         sampler=val_sampler, shuffle=shuffle,
-        pin_memory=False, worker_init_fn=data.worker_init_fn, persistent_workers=True)
+        pin_memory=False, worker_init_fn=data.worker_init_fn, persistent_workers=False)
     
     dataloader = train_loader
 
@@ -246,7 +260,8 @@ def train(rank, world_size, opt):
     interior_step_bar = tqdm(dynamic_ncols=True)
     #
     epoch_it = 1
-    train_sampler.set_epoch(epoch_it)
+    if train_sampler is not None:
+        train_sampler.set_epoch(epoch_it)
 
     print_every = cfg['training']['print_every']
     checkpoint_every = cfg['training']['checkpoint_every']
@@ -289,10 +304,9 @@ def train(rank, world_size, opt):
         '''
         step_next_upsample = 0
         step_last_upsample = 0
-        if not dataloader or dataloader.batch_size != batch_size:
+        if dataloader is None or dataloader.batch_size != batch_size:
             step_next_upsample = curriculums.next_upsample_step(curriculum, discriminator.step)
             step_last_upsample = curriculums.last_upsample_step(curriculum, discriminator.step)
-
 
             interior_step_bar.reset(total=(step_next_upsample - step_last_upsample))
             interior_step_bar.set_description(f"Progress to next stage")
@@ -319,8 +333,10 @@ def train(rank, world_size, opt):
             if scaler.get_scale() < 1:
                 scaler.update(1.)
 
-            generator_ddp.train()
-            discriminator_ddp.train()
+            # generator_ddp.train()
+            generator.train()
+            # discriminator_ddp.train()
+            discriminator.train()
 
             alpha = min(1, (discriminator.step - step_last_upsample) / (metadata['fade_steps']))
 
@@ -344,37 +360,40 @@ def train(rank, world_size, opt):
                         subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
                         #g_imgs, g_pos = generator_ddp(subset_z, **metadata)            
                         #g_imgs, g_pos = trainer.visualize(data_vis_train, mode='train')
-                        g_imgs, _ = trainer.compute_loss(data_vis_train)
+                        g_imgs, _ = trainer.decode_images(batch)
 
                         gen_imgs.append(g_imgs)
                         #gen_positions.append(g_pos)
 
                     #gen_imgs = sum(gen_imgs, [])
-                    gen_imgs = torch.cat(gen_imgs, axis=0)
+                    gen_imgs = torch.cat(gen_imgs, axis=0).permute(0, 3, 1, 2).contiguous()
+
                     #gen_positions = sum(gen_positions, [])
                     #gen_positions = torch.cat(gen_positions, axis=0)
 
-                #print(gen_imgs.shape)
-
-                gen_imgs = gen_imgs.permute(0, 2, 1)
-                gen_imgs = gen_imgs.reshape(-1, 3, 64, 64)
-                real_imgs = real_imgs.permute(0, 2, 3, 4, 1).squeeze(dim = -1)
+                real_imgs = real_imgs.flatten(0,1)
                 real_imgs.requires_grad = True
-                r_preds, _, _ = discriminator_ddp(real_imgs, alpha, **metadata)
+                # print(real_imgs.shape)
+                # print(gen_imgs.shape)
+
+                # r_preds, _, _ = discriminator_ddp(real_imgs, alpha, **metadata)
+                r_preds, _, _ = discriminator(real_imgs, alpha, **metadata)
 
             if metadata['r1_lambda'] > 0:
                 # Gradient penalty
                 grad_real = torch.autograd.grad(outputs=scaler.scale(r_preds.sum()), inputs=real_imgs, create_graph=True)
                 inv_scale = 1./scaler.get_scale()
                 grad_real = [p * inv_scale for p in grad_real][0]
+                # print(grad_real.shape)
             with torch.cuda.amp.autocast():
                 if metadata['r1_lambda'] > 0:
-                    grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+                    grad_penalty = (grad_real.contiguous().view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
                     grad_penalty = 0.5 * metadata['r1_lambda'] * grad_penalty
                 else:
                     grad_penalty = 0
 
-                g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
+                # g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
+                g_preds, g_pred_latent, g_pred_position = discriminator(gen_imgs, alpha, **metadata)
                 if metadata['z_lambda'] > 0 or metadata['pos_lambda'] > 0:
                     latent_penalty = torch.nn.MSELoss()(g_pred_latent, z) * metadata['z_lambda']
                     #position_penalty = torch.nn.MSELoss()(g_pred_position, gen_positions) * metadata['pos_lambda']
@@ -388,8 +407,10 @@ def train(rank, world_size, opt):
             optimizer_D.zero_grad()
             scaler.scale(d_loss).backward()
             scaler.unscale_(optimizer_D)
-            torch.nn.utils.clip_grad_norm_(discriminator_ddp.parameters(), metadata['grad_clip'])
+            # torch.nn.utils.clip_grad_norm_(discriminator_ddp.parameters(), metadata['grad_clip'])
+            torch.nn.utils.clip_grad_norm_(discriminator.parameters(), metadata['grad_clip'])
             scaler.step(optimizer_D)
+
 
 
             # TRAIN GENERATOR
@@ -401,9 +422,11 @@ def train(rank, world_size, opt):
                 with torch.cuda.amp.autocast():
                     subset_z = z[split * split_batch_size:(split+1) * split_batch_size]
                     #gen_imgs, gen_positions = generator_ddp(subset_z, **metadata)
-                    gen_imgs, gen_positions = trainer.visualize(data_vis_train, mode='train')
-                    
-                    g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
+                    gen_imgs, _ = trainer.decode_images(batch)
+                    gen_imgs = gen_imgs.permute(0, 3, 1, 2).contiguous()
+
+                    # g_preds, g_pred_latent, g_pred_position = discriminator_ddp(gen_imgs, alpha, **metadata)
+                    g_preds, g_pred_latent, g_pred_position = discriminator(gen_imgs, alpha, **metadata)
 
                     topk_percentage = max(0.99 ** (discriminator.step/metadata['topk_interval']), metadata['topk_v']) if 'topk_interval' in metadata and 'topk_v' in metadata else 1
                     topk_num = math.ceil(topk_percentage * g_preds.shape[0])
@@ -422,13 +445,21 @@ def train(rank, world_size, opt):
 
                 scaler.scale(g_loss).backward()
 
+            # scaler.unscale_(optimizer_G)
+            # torch.nn.utils.clip_grad_norm_(generator_ddp.parameters(), metadata.get('grad_clip', 0.3))
+            # scaler.step(optimizer_G)
+            # scaler.update()
+            # optimizer_G.zero_grad()
+            # ema.update(generator_ddp.parameters())
+            # ema2.update(generator_ddp.parameters())
+
             scaler.unscale_(optimizer_G)
-            torch.nn.utils.clip_grad_norm_(generator_ddp.parameters(), metadata.get('grad_clip', 0.3))
+            torch.nn.utils.clip_grad_norm_(generator.parameters(), metadata.get('grad_clip', 0.3))
             scaler.step(optimizer_G)
             scaler.update()
             optimizer_G.zero_grad()
-            ema.update(generator_ddp.parameters())
-            ema2.update(generator_ddp.parameters())
+            ema.update(generator.parameters())
+            ema2.update(generator.parameters())
 
 
             if rank == 0:
@@ -436,94 +467,106 @@ def train(rank, world_size, opt):
                 if i%10 == 0:
                     tqdm.write(f"[Experiment: {opt.output_dir}] [GPU: {os.environ['CUDA_VISIBLE_DEVICES']}] [Epoch: {discriminator.epoch}/{opt.n_epochs}] [D loss: {d_loss.item()}] [G loss: {g_loss.item()}] [Step: {discriminator.step}] [Alpha: {alpha:.2f}] [Img Size: {metadata['img_size']}] [Batch Size: {metadata['batch_size']}] [TopK: {topk_num}] [Scale: {scaler.get_scale()}]")
 
+                # if discriminator.step % opt.sample_interval == 0:
+                    # generator_ddp.eval()
+                    # with torch.no_grad():
+                    #     with torch.cuda.amp.autocast():
+                    #         copied_metadata = copy.deepcopy(metadata)
+                    #         copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
+                    #         copied_metadata['img_size'] = 128
+                    #         gen_imgs = generator_ddp(fixed_z.to(device),  **copied_metadata)[0]
+                    # save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_fixed.png"), nrow=5, normalize=True)
+                    #
+                    # with torch.no_grad():
+                    #     with torch.cuda.amp.autocast():
+                    #         copied_metadata = copy.deepcopy(metadata)
+                    #         copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
+                    #         copied_metadata['h_mean'] += 0.5
+                    #         copied_metadata['img_size'] = 128
+                    #         gen_imgs = generator_ddp(fixed_z.to(device),  **copied_metadata)[0]
+                    # save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_tilted.png"), nrow=5, normalize=True)
+                    #
+                    # ema.store(generator_ddp.parameters())
+                    # ema.copy_to(generator_ddp.parameters())
+                    # generator_ddp.eval()
+                    # with torch.no_grad():
+                    #     with torch.cuda.amp.autocast():
+                    #         copied_metadata = copy.deepcopy(metadata)
+                    #         copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
+                    #         copied_metadata['img_size'] = 128
+                    #         gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
+                    # save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_fixed_ema.png"), nrow=5, normalize=True)
+                    #
+                    # with torch.no_grad():
+                    #     with torch.cuda.amp.autocast():
+                    #         copied_metadata = copy.deepcopy(metadata)
+                    #         copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
+                    #         copied_metadata['h_mean'] += 0.5
+                    #         copied_metadata['img_size'] = 128
+                    #         gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
+                    # save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_tilted_ema.png"), nrow=5, normalize=True)
+                    #
+                    # with torch.no_grad():
+                    #     with torch.cuda.amp.autocast():
+                    #         copied_metadata = copy.deepcopy(metadata)
+                    #         copied_metadata['img_size'] = 128
+                    #         copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
+                    #         copied_metadata['psi'] = 0.7
+                    #         gen_imgs = generator_ddp.module.staged_forward(torch.randn_like(fixed_z).to(device),  **copied_metadata)[0]
+                    # save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_random.png"), nrow=5, normalize=True)
+                    #
+                    # ema.restore(generator_ddp.parameters())
+
                 if discriminator.step % opt.sample_interval == 0:
-                    generator_ddp.eval()
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            copied_metadata = copy.deepcopy(metadata)
-                            copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
-                            copied_metadata['img_size'] = 128
-                            gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
-                    save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_fixed.png"), nrow=5, normalize=True)
+                    pass
+                    # saveimg = gen_imgs[0].detach().cpu().permute(2,1,0).contiguous().numpy().astype(float)
+                    # # print(type(saveimg))
+                    # # print(saveimg)
+                    # plt.imshow(saveimg)
+                    # plt.savefig("out.png")
+                    # pass
+                    # torch.save(ema.state_dict(), os.path.join(opt.output_dir, 'ema.pth'))
+                    # torch.save(ema2.state_dict(), os.path.join(opt.output_dir, 'ema2.pth'))
+                    # torch.save(generator.state_dict(), os.path.join(opt.output_dir, 'generator.pth'))
+                    # torch.save(discriminator.state_dict(), os.path.join(opt.output_dir, 'discriminator.pth'))
+                    # torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, 'optimizer_G.pth'))
+                    # torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, 'optimizer_D.pth'))
+                    # torch.save(scaler.state_dict(), os.path.join(opt.output_dir, 'scaler.pth'))
+                    # torch.save(generator_losses, os.path.join(opt.output_dir, 'generator.losses'))
+                    # torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))
+                    # print('Visualizing...')
+                    # gc.collect()
+                    # torch.cuda.empty_cache()
+                    # trainer.visualize(data_vis_val, mode='val')
+                    # trainer.visualize(data_vis_train, mode='train')
 
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            copied_metadata = copy.deepcopy(metadata)
-                            copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
-                            copied_metadata['h_mean'] += 0.5
-                            copied_metadata['img_size'] = 128
-                            gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
-                    save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_tilted.png"), nrow=5, normalize=True)
+                    # Visualize Output
+                    # if opt.visnow or (i > 0 and visualize_every > 0 and (i % visualize_every) == 0):
+                    #     print('Visualizing...')
+                    #     trainer.visualize(data_vis_val, mode='val')
+                    #     trainer.visualize(data_vis_train, mode='train')
 
-                    ema.store(generator_ddp.parameters())
-                    ema.copy_to(generator_ddp.parameters())
-                    generator_ddp.eval()
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            copied_metadata = copy.deepcopy(metadata)
-                            copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
-                            copied_metadata['img_size'] = 128
-                            gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
-                    save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_fixed_ema.png"), nrow=5, normalize=True)
-
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            copied_metadata = copy.deepcopy(metadata)
-                            copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
-                            copied_metadata['h_mean'] += 0.5
-                            copied_metadata['img_size'] = 128
-                            gen_imgs = generator_ddp.module.staged_forward(fixed_z.to(device),  **copied_metadata)[0]
-                    save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_tilted_ema.png"), nrow=5, normalize=True)
-
-                    with torch.no_grad():
-                        with torch.cuda.amp.autocast():
-                            copied_metadata = copy.deepcopy(metadata)
-                            copied_metadata['img_size'] = 128
-                            copied_metadata['h_stddev'] = copied_metadata['v_stddev'] = 0
-                            copied_metadata['psi'] = 0.7
-                            gen_imgs = generator_ddp.module.staged_forward(torch.randn_like(fixed_z).to(device),  **copied_metadata)[0]
-                    save_image(gen_imgs[:25], os.path.join(opt.output_dir, f"{discriminator.step}_random.png"), nrow=5, normalize=True)
-
-                    ema.restore(generator_ddp.parameters())
-
-                if discriminator.step % opt.sample_interval == 0:
-                    torch.save(ema, os.path.join(opt.output_dir, 'ema.pth'))
-                    torch.save(ema2, os.path.join(opt.output_dir, 'ema2.pth'))
-                    torch.save(generator_ddp.module, os.path.join(opt.output_dir, 'generator.pth'))
-                    torch.save(discriminator_ddp.module, os.path.join(opt.output_dir, 'discriminator.pth'))
-                    torch.save(optimizer_G.state_dict(), os.path.join(opt.output_dir, 'optimizer_G.pth'))
-                    torch.save(optimizer_D.state_dict(), os.path.join(opt.output_dir, 'optimizer_D.pth'))
-                    torch.save(scaler.state_dict(), os.path.join(opt.output_dir, 'scaler.pth'))
-                    torch.save(generator_losses, os.path.join(opt.output_dir, 'generator.losses'))
-                    torch.save(discriminator_losses, os.path.join(opt.output_dir, 'discriminator.losses'))
-
-                # Visualize Output
-                #if opt.visnow or (i > 0 and visualize_every > 0 and (i % visualize_every) == 0):
-                #    print('Visualizing...')
-                    #trainer.visualize(data_vis_val, mode='val')
-                #    trainer.visualize(data_vis_train, mode='train')
-
-            if opt.eval_freq > 0 and (discriminator.step + 1) % opt.eval_freq == 0:
-                generated_dir = os.path.join(opt.output_dir, 'evaluation/generated')
-
-                if rank == 0:
-                    fid_evaluation.setup_evaluation(metadata['dataset'], generated_dir, target_size=128)
-                dist.barrier()
-                ema.store(generator_ddp.parameters())
-                ema.copy_to(generator_ddp.parameters())
-                generator_ddp.eval()
-                fid_evaluation.output_images(generator_ddp, metadata, rank, world_size, generated_dir)
-                ema.restore(generator_ddp.parameters())
-                dist.barrier()
-                if rank == 0:
-                    fid = fid_evaluation.calculate_fid(metadata['dataset'], generated_dir, target_size=128)
-                    with open(os.path.join(opt.output_dir, f'fid.txt'), 'a') as f:
-                        f.write(f'\n{discriminator.step}:{fid}')
+            # if opt.eval_freq > 0 and (discriminator.step + 1) % opt.eval_freq == 0:
+            #     generated_dir = os.path.join(opt.output_dir, 'evaluation/generated')
+            #
+            #     if rank == 0:
+            #         fid_evaluation.setup_evaluation(metadata['dataset'], generated_dir, target_size=128)
+            #     dist.barrier()
+            #     ema.store(generator_ddp.parameters())
+            #     ema.copy_to(generator_ddp.parameters())
+            #     generator_ddp.eval()
+            #     fid_evaluation.output_images(generator_ddp, metadata, rank, world_size, generated_dir)
+            #     ema.restore(generator_ddp.parameters())
+            #     dist.barrier()
+            #     if rank == 0:
+            #         fid = fid_evaluation.calculate_fid(metadata['dataset'], generated_dir, target_size=128)
+            #         with open(os.path.join(opt.output_dir, f'fid.txt'), 'a') as f:
+            #             f.write(f'\n{discriminator.step}:{fid}')
 
                 torch.cuda.empty_cache()
 
             discriminator.step += 1
-            generator.step += 1
+            # generator.step += 1
         discriminator.epoch += 1
         #generator.epoch += 1
         epoch_it += 1
@@ -531,6 +574,9 @@ def train(rank, world_size, opt):
     cleanup()
 
 if __name__ == '__main__':
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
     parser = argparse.ArgumentParser()
     parser.add_argument("--n_epochs", type=int, default=3000, help="number of epochs of training")
     parser.add_argument("--sample_interval", type=int, default=200, help="interval between image sampling")

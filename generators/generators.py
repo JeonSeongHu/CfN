@@ -109,7 +109,7 @@ class ImplicitGenerator3d(nn.Module):
 
     def staged_forward(self, z, img_size, fov, ray_start, ray_end, num_steps, h_stddev, v_stddev, h_mean, v_mean, psi=1, lock_view_dependence=False, max_batch_size=50000, depth_map=False, near_clip=0, far_clip=2, sample_dist=None, hierarchical_sample=False, **kwargs):
         """
-        Similar to forward but used for inference.
+        Similar to f.state_dict() used for inference.
         Calls the model sequencially using max_batch_size to limit memory usage.
         """
 

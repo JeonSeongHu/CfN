@@ -6,7 +6,7 @@ import srt.utils.visualize as vis
 from srt.utils.common import mse2psnr, reduce_dict, gather_all
 from srt.utils import nerf
 from srt.utils.common import get_rank, get_world_size
-
+import gc
 import os
 import math
 from collections import defaultdict
@@ -65,7 +65,7 @@ class SRTTrainer:
         self.optimizer.step()
         return loss.item(), loss_terms
 
-    def compute_loss(self, data):
+    def compute_loss(self, data, it):
         device = self.device
 
         input_images = data.get('input_images').to(device)
@@ -86,15 +86,16 @@ class SRTTrainer:
 
         pred_pixels, extras = self.model.decoder(z, target_camera_pos, target_rays, **self.render_kwargs)
 
-        '''loss = loss + ((pred_pixels - target_pixels)**2).mean((1, 2))
+        loss = loss + ((pred_pixels - target_pixels)**2).mean((1, 2))
         loss_terms['mse'] = loss
         if 'coarse_img' in extras:
             coarse_loss = ((extras['coarse_img'] - target_pixels)**2).mean((1, 2))
             loss_terms['coarse_mse'] = coarse_loss
             loss = loss + coarse_loss
 
-        return loss, loss_terms'''
-        return pred_pixels, extras
+        return loss, loss_terms
+
+
 
     def eval_step(self, data, full_scale=False):
         with torch.no_grad():
@@ -167,7 +168,7 @@ class SRTTrainer:
 
             batch_size, num_input_images, height, width, _ = input_rays.shape
 
-            num_angles = 6
+            num_angles = 1
 
             columns = []
             for i in range(num_input_images):
@@ -202,7 +203,37 @@ class SRTTrainer:
                     columns.append((f'depths {angle_deg}°', depth_img.cpu().numpy(), 'image'))
 
             output_img_path = os.path.join(self.out_dir, f'renders-{mode}')
-            #print(output_img_path)
-            #vis.draw_visualization_grid(columns, output_img_path)
-            return imgs, poses
+            vis.draw_visualization_grid(columns, output_img_path)
 
+
+    def decode_images(self, data):
+        device = self.device
+        input_images = data.get('input_images').to(device)
+        input_camera_pos = data.get('input_camera_pos').to(device)
+        input_rays = data.get('input_rays').to(device)
+
+        camera_pos_base = input_camera_pos[:, 0]
+        input_rays_base = input_rays[:, 0]
+
+        if 'transform' in data:
+            # If the data is transformed in some different coordinate system, where
+            # rotating around the z axis doesn't make sense, we first undo this transform,
+            # then rotate, and then reapply it.
+
+            transform = data['transform'].to(device)
+            inv_transform = torch.inverse(transform)
+            camera_pos_base = nerf.transform_points_torch(camera_pos_base, inv_transform)
+            input_rays_base = nerf.transform_points_torch(
+                input_rays_base, inv_transform.unsqueeze(1).unsqueeze(2), translate=False)
+        else:
+            transform = None
+
+        input_images_np = np.transpose(input_images.cpu().numpy(), (0, 1, 3, 4, 2))
+
+        z = self.model.encoder(input_images, input_camera_pos, input_rays)
+
+        batch_size, num_input_images, height, width, _ = input_rays.shape
+
+        img, extras = self.render_image(z, camera_pos_base, input_rays_base, **self.render_kwargs)
+
+        return img, extras
