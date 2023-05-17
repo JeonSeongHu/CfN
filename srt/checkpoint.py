@@ -51,10 +51,9 @@ class Checkpoint():
         for k, v in self.module_dict.items():
             if k in state_dict:
                 v.load_state_dict(state_dict[k])
+                print(f'"{k}" loaded')
             else:
                 print(f'Warning: Could not find "{k}" in checkpoint!')
 
-        remaining_state = {k: v for k, v in state_dict.items()
-                           if k not in self.module_dict}
+        remaining_state = {k: v for k, v in state_dict.items() if k not in self.module_dict}
         return remaining_state
-

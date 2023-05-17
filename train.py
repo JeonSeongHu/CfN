@@ -13,7 +13,11 @@ from srt.model import SRT
 from srt.trainer import SRTTrainer
 from srt.checkpoint import Checkpoint
 from srt.utils.common import init_ddp
+from srt.discriminator import DiscriminatorResNet18
 
+torch.cuda.empty_cache()
+
+#python train.py runs/msn/srt/config.yaml
 
 class LrScheduler():
     """ Implements a learning rate schedule with warum up and decay """
@@ -63,10 +67,10 @@ if __name__ == '__main__':
         max_it = 1000000
 
     exp_name = os.path.basename(os.path.dirname(args.config))
-    
-    if args.rtpt is not None:
-        from rtpt import RTPT
-        rtpt = RTPT(name_initials=args.rtpt, experiment_name=exp_name, max_iterations=max_it)
+
+    # if args.rtpt is not None:
+    #     from rtpt import RTPT
+    #     rtpt = RTPT(name_initials=args.rtpt, experiment_name=exp_name, max_iterations=max_it)
 
     out_dir = os.path.dirname(args.config)
 
@@ -105,15 +109,20 @@ if __name__ == '__main__':
         else:
             shuffle = True
 
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+    #     sampler=train_sampler, shuffle=shuffle,
+    #     worker_init_fn=data.worker_init_fn, persistent_workers=True)
+
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+        train_dataset, batch_size=batch_size, num_workers=0, pin_memory=True,
         sampler=train_sampler, shuffle=shuffle,
-        worker_init_fn=data.worker_init_fn, persistent_workers=True)
+        worker_init_fn=data.worker_init_fn)
 
     val_loader = torch.utils.data.DataLoader(
-        eval_dataset, batch_size=max(1, batch_size // 8), num_workers=1, 
+        eval_dataset, batch_size=max(1, batch_size // 8), num_workers=0,
         sampler=val_sampler, shuffle=shuffle,
-        pin_memory=False, worker_init_fn=data.worker_init_fn, persistent_workers=True)
+        pin_memory=False, worker_init_fn=data.worker_init_fn, persistent_workers=False)
 
     # Loaders for visualization scenes
     vis_loader_val = torch.utils.data.DataLoader(
@@ -125,20 +134,22 @@ if __name__ == '__main__':
     data_vis_val = next(iter(vis_loader_val))  # Validation set data for visualization
     train_dataset.mode = 'val'  # Get validation info from training set just this once
     data_vis_train = next(iter(vis_loader_train))  # Validation set data for visualization
-    train_dataset.mode = 'train'
+    train_dataset.mode  = 'train'
     print('Visualization data loaded.')
 
-    model = SRT(cfg['model']).to(device)
+    generator = SRT(cfg['model']).to(device)
+    discriminator = DiscriminatorResNet18().to(device)
+
     print('Model created.')
 
     if world_size > 1:
-        model.encoder = DistributedDataParallel(model.encoder, device_ids=[rank], output_device=rank)
-        model.decoder = DistributedDataParallel(model.decoder, device_ids=[rank], output_device=rank)
-        encoder_module = model.encoder.module
-        decoder_module = model.decoder.module
+        generator.encoder = DistributedDataParallel(generator.encoder, device_ids=[rank], output_device=rank)
+        generator.decoder = DistributedDataParallel(generator.decoder, device_ids=[rank], output_device=rank)
+        encoder_module = generator.encoder.module
+        decoder_module = generator.decoder.module
     else:
-        encoder_module = model.encoder
-        decoder_module = model.decoder
+        encoder_module = generator.encoder
+        decoder_module = generator.decoder
 
     if 'lr_warmup' in cfg['training']:
         peak_it = cfg['training']['lr_warmup']
@@ -147,20 +158,24 @@ if __name__ == '__main__':
 
     decay_it = cfg['training']['decay_it'] if 'decay_it' in cfg['training'] else 4000000
 
-    lr_scheduler = LrScheduler(peak_lr=1e-4, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
-
+    generator_lr_scheduler = LrScheduler(peak_lr=1e-4, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
+    discriminator_lr_scheduler = LrScheduler(peak_lr=1e-5, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
     # Intialize training
-    optimizer = optim.Adam(model.parameters(), lr=lr_scheduler.get_cur_lr(0))
-    trainer = SRTTrainer(model, optimizer, cfg, device, out_dir, train_dataset.render_kwargs)
+    generator_optimizer = optim.Adam(generator.parameters(), lr=generator_lr_scheduler.get_cur_lr(0))
+    discriminator_optimizer = optim.Adam(discriminator.parameters(), lr=discriminator_lr_scheduler.get_cur_lr(0))
+    trainer = SRTTrainer(generator, discriminator, generator_optimizer, discriminator_optimizer, cfg, device, out_dir, train_dataset.render_kwargs)
     checkpoint = Checkpoint(out_dir, device=device, encoder=encoder_module,
-                            decoder=decoder_module, optimizer=optimizer)
+                            decoder=decoder_module, generator_optimizer=generator_optimizer,
+                            discriminator_optimizer = discriminator_optimizer,
+                             discriminator = discriminator, optimizer=generator_optimizer)
 
     # Try to automatically resume
     try:
-        if os.path.exists(os.path.join(out_dir, f'model_{max_it}.pt')):
-            load_dict = checkpoint.load(f'model_{max_it}.pt')
+        if os.path.exists(os.path.join(out_dir, f'generator_c{max_it}.pt')):
+            load_dict = checkpoint.load(f'generator.pt')
         else:
-            load_dict = checkpoint.load('model.pt')
+            load_dict = checkpoint.load('generator.pt')
+            # load_dict = checkpoint.load('model.pt')
     except FileNotFoundError:
         load_dict = dict()
 
@@ -176,6 +191,7 @@ if __name__ == '__main__':
     if args.wandb:
         import wandb
         if run_id is None:
+
             run_id =  wandb.util.generate_id()
             print(f'Sampled new wandb run_id {run_id}.')
         else:
@@ -185,18 +201,23 @@ if __name__ == '__main__':
         wandb.config = cfg
 
     if args.print_model:
-        print(model)
-        for name, param in model.named_parameters():
+        print("Generator: ")
+        for name, param in generator.named_parameters():
+            if param.requires_grad:
+                print(f'{name:80}{str(list(param.data.shape)):20}{int(param.data.numel()):10d}')
+        print("Discriminator: ")
+        for name, param in discriminator.named_parameters():
             if param.requires_grad:
                 print(f'{name:80}{str(list(param.data.shape)):20}{int(param.data.numel()):10d}')
 
-    num_encoder_params = sum(p.numel() for p in model.encoder.parameters())
-    num_decoder_params = sum(p.numel() for p in model.decoder.parameters())
+    num_encoder_params = sum(p.numel() for p in generator.encoder.parameters())
+    num_decoder_params = sum(p.numel() for p in generator.decoder.parameters())
+    num_discriminator_params = sum(p.numel() for p in discriminator.parameters())
     print('Number of parameters:')
-    print(f'Encoder: {num_encoder_params}, Decoder: {num_decoder_params}, Total: {num_encoder_params + num_decoder_params}')
+    print(f'Encoder: {num_encoder_params}, Decoder: {num_decoder_params}, Discriminator: {num_discriminator_params} Total: {num_encoder_params + num_decoder_params + num_discriminator_params}')
 
-    if args.rtpt is not None:
-        rtpt.start()
+    # if args.rtpt is not None:
+    #     rtpt.start()
 
     # Shorthands
     print_every = cfg['training']['print_every']
@@ -208,27 +229,34 @@ if __name__ == '__main__':
     # Training loop
     while True:
         epoch_it += 1
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch_it)
+        # if train_sampler is not None:
+        #     train_sampler.set_epoch(epoch_it)
 
+        ## SRT의 training iteration
         for batch in train_loader:
             it += 1
-
             # Special responsibilities for the main process
             if rank == 0:
-                checkpoint_scalars = {'epoch_it': epoch_it,
+                gen_checkpoint_scalars = {'epoch_it': epoch_it,
                                       'it': it,
                                       't': time_elapsed,
                                       'loss_val_best': metric_val_best,
                                       'run_id': run_id}
-                # Save checkpoint
+                dis_checkpoint_scalars = {'epoch_it': epoch_it,
+                                      'it': it,
+                                      't': time_elapsed,
+                                      'loss_val_best': metric_val_best,
+                                      'run_id': run_id}
+                # Save checkpoint,  나중에 수정 필요
                 if (checkpoint_every > 0 and (it % checkpoint_every) == 0) and it > 0:
-                    checkpoint.save('model.pt', **checkpoint_scalars)
+                    checkpoint.save('generator.pt', **gen_checkpoint_scalars)
+                    checkpoint.save('discriminator_%d.pt' % it, **gen_checkpoint_scalars)
                     print('Checkpoint saved.')
 
                 # Backup if necessary
                 if (backup_every > 0 and (it % backup_every) == 0):
-                    checkpoint.save('model_%d.pt' % it, **checkpoint_scalars)
+                    checkpoint.save('generator_%d.pt' % it, **dis_checkpoint_scalars)
+                    checkpoint.save('discriminator_%d.pt' % it, **dis_checkpoint_scalars)
                     print('Backup checkpoint saved.')
 
                 # Visualize output
@@ -237,34 +265,44 @@ if __name__ == '__main__':
                     trainer.visualize(data_vis_val, mode='val')
                     trainer.visualize(data_vis_train, mode='train')
 
+                # show output
+                if it % 100 == 0:
+                    trainer.show = True
+
             # Run evaluation
-            if args.evalnow or (it > 0 and validate_every > 0 and (it % validate_every) == 0):
-                print('Evaluating...')
-                eval_dict = trainer.evaluate(val_loader)
-                metric_val = eval_dict[model_selection_metric]
-                print(f'Validation metric ({model_selection_metric}): {metric_val:.4f}')
-
-                if args.wandb:
-                    wandb.log(eval_dict, step=it)
-
-                if model_selection_sign * (metric_val - metric_val_best) > 0:
-                    metric_val_best = metric_val
-                    if rank == 0:
-                        checkpoint_scalars['loss_val_best'] = metric_val_best
-                        print(f'New best model (loss {metric_val_best:.6f})')
-                        checkpoint.save('model_best.pt', **checkpoint_scalars)
+            # if args.evalnow or (it > 0 and validate_every > 0 and (it % validate_every) == 0):
+            #     print('Evaluating...')
+            #     eval_dict = trainer.evaluate(val_loader)
+            #     metric_val = eval_dict[model_selection_metric]
+            #     print(f'Validation metric ({model_selection_metric}): {metric_val:.4f}')
+            #
+            #     if args.wandb:
+            #         wandb.log(eval_dict, step=it)
+            #
+            #     if model_selection_sign * (metric_val - metric_val_best) > 0:
+            #         metric_val_best = metric_val
+            #         if rank == 0:
+            #             gen_checkpoint_scalars['loss_val_best'] = metric_val_best
+            #             print(f'New best generator (loss {metric_val_best:.6f})')
+            #             checkpoint.save('generator_best.pt', **gen_checkpoint_scalars)
 
             # Update learning rate
-            new_lr = lr_scheduler.get_cur_lr(it)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = new_lr
+            gen_new_lr = generator_lr_scheduler.get_cur_lr(it)
+            dis_new_lr = discriminator_lr_scheduler.get_cur_lr(it)
+            for param_group in generator_optimizer.param_groups:
+                param_group['lr'] = gen_new_lr
+            for param_group in discriminator_optimizer.param_groups:
+                param_group['lr'] = dis_new_lr
 
             # Run training step
             t0 = time.perf_counter()
+            ### 이 부분에서 step 학습 !
             loss, log_dict = trainer.train_step(batch, it)
             time_elapsed += time.perf_counter() - t0
             time_elapsed_str = str(datetime.timedelta(seconds=time_elapsed))
-            log_dict['lr'] = new_lr
+            log_dict['gen_lr'] = gen_new_lr
+            log_dict['dis_Lr'] = dis_new_lr
+            torch.cuda.empty_cache()
 
             # Print progress
             if print_every > 0 and (it % print_every) == 0:
@@ -281,9 +319,8 @@ if __name__ == '__main__':
             args.evalnow = False
             args.visnow = False
 
-            if it >= max_it:
-                print('Iteration limit reached. Exiting.')
-                if rank == 0:
-                    checkpoint.save('model.pt', **checkpoint_scalars)
-                exit(0)
-
+            # if it >= max_it:
+            #     print('Iteration limit reached. Exiting.')
+            #     if rank == 0:
+            #         checkpoint.save('generator.pt', **checkpoint_scalars)
+            #     exit(0)

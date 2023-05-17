@@ -1,7 +1,7 @@
 
 data:
   dataset: msn
-  num_points: 8192
+  num_points: 1024
 model:
   encoder_kwargs:
     pos_start_octave: -5
@@ -11,14 +11,14 @@ model:
 
 training:
   num_workers: 1
-  batch_size: 256
+  batch_size: 6
   model_selection_metric: psnr
   model_selection_mode: maximize
   print_every: 10
-  visualize_every: 5000
+  visualize_every: 1000
   validate_every: 5000
   checkpoint_every: 1000
   backup_every: 100000
-  max_it: 4000000
+  max_it: 400000000000
   decay_it: 4000000
   lr_warmup: 2500
