@@ -13,11 +13,11 @@ from srt.model import SRT
 from srt.trainer import SRTTrainer
 from srt.checkpoint import Checkpoint
 from srt.utils.common import init_ddp
-from srt.discriminator import DiscriminatorResNet18
+from srt.discriminator import DiscriminatorResNet50,  PatchDiscriminatorPix2Pix
 
 torch.cuda.empty_cache()
 
-#python train.py runs/msn/srt/config.yaml
+#python train_gridOnly.py runs/msn/srt/config.yaml
 
 class LrScheduler():
     """ Implements a learning rate schedule with warum up and decay """
@@ -138,8 +138,9 @@ if __name__ == '__main__':
     print('Visualization data loaded.')
 
     generator = SRT(cfg['model']).to(device)
-    discriminator = DiscriminatorResNet18().to(device)
+    discriminator = DiscriminatorResNet50().to(device)
 
+    # discriminator= PatchDiscriminatorPix2Pix().to(device)
     print('Model created.')
 
     if world_size > 1:
@@ -158,7 +159,7 @@ if __name__ == '__main__':
 
     decay_it = cfg['training']['decay_it'] if 'decay_it' in cfg['training'] else 4000000
 
-    generator_lr_scheduler = LrScheduler(peak_lr=1e-4, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
+    generator_lr_scheduler = LrScheduler(peak_lr=1e-6, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
     discriminator_lr_scheduler = LrScheduler(peak_lr=1e-5, peak_it=peak_it, decay_it=decay_it, decay_rate=0.16)
     # Intialize training
     generator_optimizer = optim.Adam(generator.parameters(), lr=generator_lr_scheduler.get_cur_lr(0))
@@ -262,8 +263,8 @@ if __name__ == '__main__':
                 # Visualize output
                 if args.visnow or (it > 0 and visualize_every > 0 and (it % visualize_every) == 0):
                     print('Visualizing...')
-                    trainer.visualize(data_vis_val, mode='val')
-                    trainer.visualize(data_vis_train, mode='train')
+                    trainer.visualize(data_vis_val, it,mode='val')
+                    trainer.visualize(data_vis_train, it, mode='train')
 
                 # show output
                 if it % 100 == 0:

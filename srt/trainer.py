@@ -131,27 +131,22 @@ class SRTTrainer:
 
         ### Train Generator
         # print(pred_imgs.shape, target_images.shape)
-        mse = ((pred_imgs - target_images) ** 2).mean()
+        mse = nn.L1Loss()(pred_imgs, target_images).mean()
 
         fake_logits = []
+
         for i in range(pred_imgs.shape[1]):
             fake_logits.append(self.discriminator(pred_imgs[:, i].permute(0, 3, 1, 2)))
         fake_logits = torch.vstack(fake_logits)
         gen_labels = torch.ones_like(fake_logits, requires_grad=False)
 
-        a, b = 0.008, 1
+        a, b = 0.00005, 1
         g_loss = a * criterion(fake_logits, gen_labels) + b * mse
 
         ### Train Discriminator
-        real_logits = []
-        for i in range(pred_imgs.shape[1]):
-            real_logits.append(self.discriminator(target_images[:, i].permute(0, 3, 1, 2).detach()))
-        real_logits = torch.vstack(real_logits)
 
-        fake_logits = []
-        for i in range(pred_imgs.shape[1]):
-            fake_logits.append(self.discriminator(pred_imgs[:, i].permute(0, 3, 1, 2).detach()))
-        fake_logits = torch.vstack(fake_logits)
+        real_logits = self.discriminator(target_images.flatten(0,1).permute(0, 3, 1, 2).detach())
+        fake_logits = self.discriminator(pred_imgs.flatten(0,1).permute(0, 3, 1, 2).detach())
 
         real_labels = torch.ones_like(real_logits, requires_grad=False)
         fake_labels = torch.zeros_like(fake_logits, requires_grad=False)
@@ -232,7 +227,7 @@ class SRTTrainer:
         return img, agg_extras
 
 
-    def visualize(self, data, mode='val'):
+    def visualize(self, data, it,mode='val'):
         device = "cuda"
         self.generator.eval()
         self.generator = self.generator.to(device)
@@ -293,6 +288,6 @@ class SRTTrainer:
                     depth_img = depth_img.view(batch_size, height, width, 1)
                     columns.append((f'depths {angle_deg}°', depth_img.cpu().numpy(), 'image'))
 
-            output_img_path = os.path.join(self.out_dir, f'renders-{mode}')
+            output_img_path = os.path.join(self.out_dir, f'renders-{mode}-{it}')
             vis.draw_visualization_grid(columns, output_img_path)
 #
